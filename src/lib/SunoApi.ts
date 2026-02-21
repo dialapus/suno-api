@@ -350,17 +350,14 @@ class SunoApi {
       }
     }
 
-    logger.info('Waiting for Suno interface to load');
+    logger.info('Waiting for Suno interface to fully render (React hydration)...');
     try {
-      // Wait for any Suno API response that signals the app is hydrated
-      await Promise.race([
-        page.waitForResponse(resp => resp.url().includes('suno.com/api/') || resp.url().includes('studio-api.prod.suno.com'), { timeout: 15000 }),
-        page.waitForSelector('textarea, [contenteditable="true"], [class*="textarea"]', { timeout: 15000 }),
-      ]);
-      logger.info('Suno interface detected (API response or textarea)');
+      // Wait for network to be idle (signals React has loaded all data and rendered)
+      // This is critical on Railway where headless browser renders very slowly (~30s+)
+      await page.waitForLoadState('networkidle', { timeout: 60000 });
+      logger.info('Network idle — React should be hydrated');
     } catch(e) {
-      logger.info('Neither API response nor textarea detected within 15s, adding extra wait...');
-      await page.waitForTimeout(5000); // Give React more time to hydrate
+      logger.info('Network idle timeout — proceeding anyway');
     }
 
     if (this.ghostCursorEnabled)
@@ -391,8 +388,9 @@ class SunoApi {
     let textarea: Locator = page.locator('textarea').first(); // default, will be overwritten
     let found = false;
     try {
-      // Wait for ANY textarea to appear (30s total), then identify which one
-      const handle = await page.waitForSelector(textareaCssOrSelector, { timeout: 30000 });
+      // After networkidle wait above, element should be present quickly
+      // 15s as a safety buffer in case networkidle fired slightly early
+      const handle = await page.waitForSelector(textareaCssOrSelector, { timeout: 15000 });
       const placeholder = await handle.getAttribute('placeholder') ?? '';
       logger.info(`Textarea appeared with placeholder: "${placeholder}"`);
       // Now pick the most appropriate textarea (prefer lyrics/prompt textarea)
