@@ -329,6 +329,12 @@ class SunoApi {
     if (!await this.captchaRequired())
       return null;
 
+    // If 2Captcha key is not configured, skip browser flow — captcha will be attempted without token
+    if (!process.env.TWOCAPTCHA_KEY || process.env.TWOCAPTCHA_KEY.trim() === '') {
+      logger.info('CAPTCHA required but TWOCAPTCHA_KEY not set — skipping captcha browser flow, sending null token');
+      return null;
+    }
+
     logger.info('CAPTCHA required. Launching browser...')
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
