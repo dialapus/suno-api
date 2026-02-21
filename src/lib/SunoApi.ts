@@ -367,44 +367,85 @@ class SunoApi {
 
     // Try multiple selectors for the textarea (Suno may update UI class names)
     logger.info('Looking for song description textarea...');
-    let textarea = page.locator('.custom-textarea');
-    try {
-      await textarea.waitFor({ timeout: 15000 });
-    } catch(e) {
-      logger.info('.custom-textarea not found, trying fallback selectors...');
-      // Try alternative selectors
-      const fallbacks = [
-        'textarea[placeholder]',
-        'div[contenteditable="true"]',
-        '[data-testid*="prompt"]',
-        '[class*="textarea"]',
-        '[class*="prompt"]',
-        'textarea',
-      ];
-      let found = false;
-      for (const sel of fallbacks) {
-        try {
-          textarea = page.locator(sel).first();
-          await textarea.waitFor({ timeout: 5000 });
-          logger.info(`Found textarea with fallback selector: ${sel}`);
-          found = true;
-          break;
-        } catch(e2) {}
-      }
-      if (!found) {
-        // Log page content for debugging
-        const pageContent = await page.content();
-        logger.info(`Page URL: ${page.url()}`);
-        logger.info(`Page title: ${await page.title()}`);
-        logger.info(`Page HTML length: ${pageContent.length}`);
-        browser.browser()?.close();
-        throw new Error('Could not find textarea on Suno create page. UI may have changed. URL: ' + page.url());
-      }
+    // Selectors in priority order (most specific first)
+    const selectors = [
+      'textarea[placeholder="Chat to make music"]',  // Current Suno UI (2025+)
+      'textarea[placeholder*="music"]',
+      'textarea[placeholder*="song"]',
+      '.custom-textarea',                              // Legacy selector
+      'textarea[placeholder]',
+      'div[contenteditable="true"]',
+      '[data-testid*="prompt"]',
+      '[class*="textarea"]',
+      '[class*="prompt"]',
+      'textarea',
+    ];
+    let textarea = page.locator(selectors[0]);
+    let found = false;
+    for (const sel of selectors) {
+      try {
+        textarea = page.locator(sel).first();
+        await textarea.waitFor({ timeout: 5000 });
+        logger.info(`Found textarea with selector: ${sel}`);
+        found = true;
+        break;
+      } catch(e) {}
+    }
+    if (!found) {
+      // Dump DOM diagnostics for debugging
+      const pageContent = await page.content();
+      const url = page.url();
+      const title = await page.title();
+      logger.info(`Page URL: ${url}`);
+      logger.info(`Page title: ${title}`);
+      logger.info(`Page HTML length: ${pageContent.length}`);
+      
+      // Extract interactive elements for diagnostics
+      const diagnostics = await page.evaluate(() => {
+        const els: string[] = [];
+        // All textareas
+        document.querySelectorAll('textarea').forEach((el, i) => {
+          els.push(`textarea#${i}: class="${el.className}" placeholder="${el.placeholder}" id="${el.id}"`);
+        });
+        // All contenteditable
+        document.querySelectorAll('[contenteditable]').forEach((el, i) => {
+          els.push(`contenteditable#${i}: tag=${el.tagName} class="${el.className}" ce="${el.getAttribute('contenteditable')}"`);
+        });
+        // All inputs
+        document.querySelectorAll('input[type="text"], input:not([type])').forEach((el: any, i) => {
+          els.push(`input#${i}: class="${el.className}" placeholder="${el.placeholder}" id="${el.id}" name="${el.name}"`);
+        });
+        // All buttons  
+        document.querySelectorAll('button').forEach((el, i) => {
+          els.push(`button#${i}: class="${el.className}" aria-label="${el.getAttribute('aria-label')}" text="${el.textContent?.trim().substring(0, 50)}"`);
+        });
+        // Elements with "prompt" or "create" in class/id
+        document.querySelectorAll('[class*="prompt"], [class*="create"], [class*="input"], [class*="editor"], [role="textbox"]').forEach((el, i) => {
+          els.push(`match#${i}: tag=${el.tagName} class="${el.className?.toString().substring(0, 100)}" role="${el.getAttribute('role')}" ce="${el.getAttribute('contenteditable')}"`);
+        });
+        return els;
+      });
+      
+      logger.info('=== DOM DIAGNOSTICS ===');
+      diagnostics.forEach(d => logger.info(d));
+      logger.info('=== END DIAGNOSTICS ===');
+      
+      browser.browser()?.close();
+      throw new Error(`Could not find textarea on Suno create page. UI may have changed. URL: ${url}. Diagnostics: ${JSON.stringify(diagnostics)}`);
     }
     await this.click(textarea);
     await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
 
-    const button = page.locator('button[aria-label="Create"]').locator('div.flex');
+    // Find Create button - try aria-label first, then text-based fallback
+    let button: Locator;
+    try {
+      const btnAriaLabel = page.locator('button[aria-label="Create"]');
+      await btnAriaLabel.waitFor({ timeout: 2000 });
+      button = btnAriaLabel.locator('div').first();
+    } catch(e) {
+      // Fallback: find by text content (Suno removed aria-label in 2025)
+      button = page.locator('button').filter({ hasText: /^Create$/ }).first();
+    }
     this.click(button);
 
     const controller = new AbortController();
