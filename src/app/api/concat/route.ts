@@ -28,9 +28,9 @@ export async function POST(req: NextRequest) {
         }
       });
     } catch (error: any) {
-      console.error('Error generating concatenating audio:', error.response.data);
-      if (error.response.status === 402) {
-        return new NextResponse(JSON.stringify({ error: error.response.data.detail }), {
+      console.error('Error generating concatenating audio:', error?.response?.data);
+      if (error?.response?.status === 402) {
+        return new NextResponse(JSON.stringify({ error: error?.response?.data?.detail || error?.message || "Unknown error" }), {
           status: 402,
           headers: {
             'Content-Type': 'application/json',
