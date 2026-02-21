@@ -373,32 +373,51 @@ class SunoApi {
 
     // Try multiple selectors for the textarea (Suno may update UI class names)
     logger.info('Looking for song description textarea...');
-    // Selectors in priority order (most specific first)
-    const selectors = [
-      'textarea[placeholder="Chat to make music"]',  // Current Suno UI (2025+)
+    // Wait up to 30s for ANY textarea to appear (React may render late after Clerk handshake)
+    // NOTE: Authenticated suno.com/create uses different placeholders than the home page!
+    // Verified Feb 2026: placeholders are "Write some lyrics or a prompt — or leave blank for instrumental"
+    //                    and "Describe the sound you want"
+    const textareaCssOrSelector = [
+      'textarea[placeholder*="lyrics"]',
+      'textarea[placeholder*="prompt"]',
+      'textarea[placeholder*="sound"]',
       'textarea[placeholder*="music"]',
       'textarea[placeholder*="song"]',
-      '.custom-textarea',                              // Legacy selector
+      '.custom-textarea',
       'textarea[placeholder]',
-      'div[contenteditable="true"]',
-      '[data-testid*="prompt"]',
-      '[class*="textarea"]',
-      '[class*="prompt"]',
       'textarea',
-    ];
-    let textarea = page.locator(selectors[0]);
+    ].join(', ');
+    
+    let textarea: Locator = page.locator('textarea').first(); // default, will be overwritten
     let found = false;
-    for (let i = 0; i < selectors.length; i++) {
-      const sel = selectors[i];
-      // Give more time to first/primary selectors; less to legacy fallbacks
-      const timeout = i < 3 ? 10000 : 5000;
-      try {
-        textarea = page.locator(sel).first();
-        await textarea.waitFor({ timeout });
-        logger.info(`Found textarea with selector: ${sel}`);
-        found = true;
-        break;
-      } catch(e) {}
+    try {
+      // Wait for ANY textarea to appear (30s total), then identify which one
+      const handle = await page.waitForSelector(textareaCssOrSelector, { timeout: 30000 });
+      const placeholder = await handle.getAttribute('placeholder') ?? '';
+      logger.info(`Textarea appeared with placeholder: "${placeholder}"`);
+      // Now pick the most appropriate textarea (prefer lyrics/prompt textarea)
+      const preferredSelectors = [
+        'textarea[placeholder*="lyrics"]',
+        'textarea[placeholder*="prompt"]',
+        'textarea[placeholder*="sound"]',
+        'textarea[placeholder*="music"]',
+        'textarea[placeholder*="song"]',
+        '.custom-textarea',
+        'textarea[placeholder]',
+        'textarea',
+      ];
+      for (const sel of preferredSelectors) {
+        const el = page.locator(sel).first();
+        const count = await el.count();
+        if (count > 0) {
+          textarea = el;
+          logger.info(`Using textarea selector: ${sel}`);
+          found = true;
+          break;
+        }
+      }
+    } catch(e) {
+      logger.info('No textarea found within 30s');
     }
     if (!found) {
       // Dump DOM diagnostics for debugging
@@ -445,15 +464,26 @@ class SunoApi {
     await this.click(textarea);
     await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
 
-    // Find Create button - try aria-label first, then text-based fallback
-    let button: Locator;
-    try {
-      const btnAriaLabel = page.locator('button[aria-label="Create"]');
-      await btnAriaLabel.waitFor({ timeout: 2000 });
-      button = btnAriaLabel.locator('div').first();
-    } catch(e) {
-      // Fallback: find by text content (Suno removed aria-label in 2025)
+    // Find Create button - try multiple selectors
+    // Verified Feb 2026: aria-label="Create song" on authenticated page
+    let button: Locator | null = null;
+    const buttonSelectors = [
+      'button[aria-label="Create song"]',   // Authenticated create page (Feb 2026)
+      'button[aria-label="Create"]',        // Legacy
+    ];
+    for (const sel of buttonSelectors) {
+      try {
+        const el = page.locator(sel);
+        await el.waitFor({ timeout: 3000 });
+        button = el;
+        logger.info(`Found Create button with selector: ${sel}`);
+        break;
+      } catch(e) {}
+    }
+    if (!button) {
+      // Final fallback: find by text content
       button = page.locator('button').filter({ hasText: /^Create$/ }).first();
+      logger.info('Using text-based Create button fallback');
     }
     this.click(button);
 
