@@ -567,6 +567,30 @@ class SunoApi {
     this.click(button);
 
     const controller = new AbortController();
+
+    // Create the route interceptor promise first so we can reject it from the captcha loop
+    let rejectRoutePromise: (err: any) => void;
+    const routePromise = new Promise<string | null>((resolve, reject) => {
+      rejectRoutePromise = reject;
+      page.route('**/api/generate/v2/**', async (route: any) => {
+        try {
+          logger.info('hCaptcha token received. Closing browser');
+          route.abort();
+          browser.browser()?.close();
+          controller.abort();
+          const request = route.request();
+          this.currentToken = request.headers().authorization.split('Bearer ').pop();
+          resolve(request.postDataJSON().token);
+        } catch(err) {
+          reject(err);
+        }
+      });
+      // Safety timeout: if hCaptcha flow takes too long, reject instead of hanging forever
+      setTimeout(() => {
+        reject(new Error('getCaptcha timeout: no token intercepted within 5 minutes'));
+      }, 300000);
+    });
+
     new Promise<void>(async (resolve, reject) => {
       const frame = page.frameLocator('iframe[title*="hCaptcha"]');
       const challenge = frame.locator('.challenge-container');
@@ -641,24 +665,13 @@ class SunoApi {
           reject(e);
       }
     }).catch(e => {
-      browser.browser()?.close();
-      throw e;
+      logger.info(`Captcha solving failed: ${e.message}`);
+      try { browser.browser()?.close(); } catch(_) {}
+      // CRITICAL: reject the route promise so getCaptcha() doesn't hang forever
+      rejectRoutePromise(e);
     });
-    return (new Promise((resolve, reject) => {
-      page.route('**/api/generate/v2/**', async (route: any) => {
-        try {
-          logger.info('hCaptcha token received. Closing browser');
-          route.abort();
-          browser.browser()?.close();
-          controller.abort();
-          const request = route.request();
-          this.currentToken = request.headers().authorization.split('Bearer ').pop();
-          resolve(request.postDataJSON().token);
-        } catch(err) {
-          reject(err);
-        }
-      });
-    }));
+
+    return routePromise;
   }
 
   /**
