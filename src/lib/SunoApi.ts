@@ -357,7 +357,30 @@ class SunoApi {
       await page.waitForLoadState('networkidle', { timeout: 60000 });
       logger.info('Network idle — React should be hydrated');
     } catch(e) {
-      logger.info('Network idle timeout — proceeding anyway');
+      logger.info('Network idle timeout — trying domcontentloaded fallback');
+      try {
+        await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+        logger.info('DOM content loaded');
+      } catch(e2) {
+        logger.info('domcontentloaded also timed out — proceeding anyway');
+      }
+    }
+
+    // Extra safety: wait until page stops navigating (URL stabilizes)
+    try {
+      await page.waitForURL('**/create**', { timeout: 15000, waitUntil: 'domcontentloaded' });
+      logger.info(`URL stabilized at: ${page.url()}`);
+    } catch(e) {
+      logger.info(`waitForURL /create failed or timed out: ${page.url()}`);
+    }
+
+    // Take a diagnostic screenshot to see what's actually on screen
+    try {
+      const screenshotPath = `/tmp/suno-debug-${Date.now()}.png`;
+      await page.screenshot({ path: screenshotPath, fullPage: true, timeout: 10000 });
+      logger.info(`Debug screenshot saved: ${screenshotPath}`);
+    } catch(e) {
+      logger.info(`Screenshot failed: ${e}`);
     }
 
     if (this.ghostCursorEnabled)
@@ -387,81 +410,132 @@ class SunoApi {
     
     let textarea: Locator = page.locator('textarea').first(); // default, will be overwritten
     let found = false;
-    try {
-      // Use waitForFunction which runs in page context - more reliable than waitForSelector
-      // for dynamically rendered React content. The page can take 30-60s to render in Railway.
-      await page.waitForFunction(
-        () => {
-          // Look for textareas with actual content-related placeholders
-          const textareas = Array.from(document.querySelectorAll('textarea'));
-          return textareas.some(t => t.placeholder && t.placeholder.length > 3);
-        },
-        { timeout: 60000, polling: 1000 }
-      );
-      logger.info('Textarea detected via waitForFunction');
-      
-      // Now pick the most appropriate textarea (prefer lyrics/prompt textarea)
-      const preferredSelectors = [
-        'textarea[placeholder*="lyrics"]',
-        'textarea[placeholder*="prompt"]',
-        'textarea[placeholder*="sound"]',
-        'textarea[placeholder*="music"]',
-        'textarea[placeholder*="song"]',
-        '.custom-textarea',
-        'textarea[placeholder]',
-        'textarea',
-      ];
-      for (const sel of preferredSelectors) {
-        const el = page.locator(sel).first();
-        const count = await el.count();
-        if (count > 0) {
-          textarea = el;
-          logger.info(`Using textarea selector: ${sel}`);
-          found = true;
-          break;
+    // Retry waitForFunction in case of transient navigation errors
+    for (let attempt = 0; attempt < 3 && !found; attempt++) {
+      if (attempt > 0) {
+        logger.info(`Retry attempt ${attempt} for textarea detection...`);
+        await page.waitForTimeout(3000);
+        // Ensure page is stable before retrying
+        try {
+          await page.waitForLoadState('domcontentloaded', { timeout: 10000 });
+        } catch(e) {}
+      }
+      try {
+        // Use waitForFunction which runs in page context - more reliable than waitForSelector
+        // for dynamically rendered React content. The page can take 30-60s to render in Railway.
+        await page.waitForFunction(
+          () => {
+            // Look for textareas with actual content-related placeholders
+            const textareas = Array.from(document.querySelectorAll('textarea'));
+            return textareas.some(t => t.placeholder && t.placeholder.length > 3);
+          },
+          { timeout: 60000, polling: 1000 }
+        );
+        logger.info('Textarea detected via waitForFunction');
+        
+        // Now pick the most appropriate textarea (prefer lyrics/prompt textarea)
+        const preferredSelectors = [
+          'textarea[placeholder*="lyrics"]',
+          'textarea[placeholder*="prompt"]',
+          'textarea[placeholder*="sound"]',
+          'textarea[placeholder*="music"]',
+          'textarea[placeholder*="song"]',
+          '.custom-textarea',
+          'textarea[placeholder]',
+          'textarea',
+        ];
+        for (const sel of preferredSelectors) {
+          try {
+            const el = page.locator(sel).first();
+            const count = await el.count();
+            if (count > 0) {
+              textarea = el;
+              logger.info(`Using textarea selector: ${sel}`);
+              found = true;
+              break;
+            }
+          } catch(selErr) {
+            logger.info(`Selector ${sel} error: ${selErr}`);
+          }
+        }
+        break; // waitForFunction succeeded, exit retry loop
+      } catch(e: any) {
+        logger.info(`waitForFunction attempt ${attempt} failed: ${e}`);
+        if (e.message?.includes('navigating') || e.message?.includes('navigation')) {
+          // Page is navigating — wait for it to settle
+          try {
+            await page.waitForLoadState('load', { timeout: 30000 });
+            logger.info('Page load state recovered after navigation error');
+          } catch(e2) {
+            logger.info(`Load state recovery failed: ${e2}`);
+          }
         }
       }
-    } catch(e) {
-      logger.info(`waitForFunction failed: ${e}`);
     }
     if (!found) {
       // Dump DOM diagnostics for debugging
-      const pageContent = await page.content();
       const url = page.url();
-      const title = await page.title();
       logger.info(`Page URL: ${url}`);
-      logger.info(`Page title: ${title}`);
-      logger.info(`Page HTML length: ${pageContent.length}`);
+      
+      // Screenshot first (before any DOM access that might fail during navigation)
+      try {
+        const screenshotPath = `/tmp/suno-notfound-${Date.now()}.png`;
+        await page.screenshot({ path: screenshotPath, fullPage: true, timeout: 10000 });
+        logger.info(`Not-found screenshot: ${screenshotPath}`);
+      } catch(e) {
+        logger.info(`Screenshot failed: ${e}`);
+      }
+      
+      let pageContent = '';
+      let title = '';
+      let diagnostics: string[] = [];
+      
+      try {
+        pageContent = await page.content();
+        logger.info(`Page HTML length: ${pageContent.length}`);
+      } catch(e) {
+        logger.info(`page.content() failed (likely navigating): ${e}`);
+      }
+      
+      try {
+        title = await page.title();
+        logger.info(`Page title: ${title}`);
+      } catch(e) {
+        logger.info(`page.title() failed: ${e}`);
+      }
       
       // Extract interactive elements for diagnostics
-      const diagnostics = await page.evaluate(() => {
-        const els: string[] = [];
-        // All textareas
-        document.querySelectorAll('textarea').forEach((el, i) => {
-          els.push(`textarea#${i}: class="${el.className}" placeholder="${el.placeholder}" id="${el.id}"`);
+      try {
+        diagnostics = await page.evaluate(() => {
+          const els: string[] = [];
+          // All textareas
+          document.querySelectorAll('textarea').forEach((el, i) => {
+            els.push(`textarea#${i}: class="${el.className}" placeholder="${el.placeholder}" id="${el.id}"`);
+          });
+          // All contenteditable
+          document.querySelectorAll('[contenteditable]').forEach((el, i) => {
+            els.push(`contenteditable#${i}: tag=${el.tagName} class="${el.className}" ce="${el.getAttribute('contenteditable')}"`);
+          });
+          // All inputs
+          document.querySelectorAll('input[type="text"], input:not([type])').forEach((el: any, i) => {
+            els.push(`input#${i}: class="${el.className}" placeholder="${el.placeholder}" id="${el.id}" name="${el.name}"`);
+          });
+          // All buttons  
+          document.querySelectorAll('button').forEach((el, i) => {
+            els.push(`button#${i}: class="${el.className}" aria-label="${el.getAttribute('aria-label')}" text="${el.textContent?.trim().substring(0, 50)}"`);
+          });
+          // Elements with "prompt" or "create" in class/id
+          document.querySelectorAll('[class*="prompt"], [class*="create"], [class*="input"], [class*="editor"], [role="textbox"]').forEach((el, i) => {
+            els.push(`match#${i}: tag=${el.tagName} class="${el.className?.toString().substring(0, 100)}" role="${el.getAttribute('role')}" ce="${el.getAttribute('contenteditable')}"`);
+          });
+          return els;
         });
-        // All contenteditable
-        document.querySelectorAll('[contenteditable]').forEach((el, i) => {
-          els.push(`contenteditable#${i}: tag=${el.tagName} class="${el.className}" ce="${el.getAttribute('contenteditable')}"`);
-        });
-        // All inputs
-        document.querySelectorAll('input[type="text"], input:not([type])').forEach((el: any, i) => {
-          els.push(`input#${i}: class="${el.className}" placeholder="${el.placeholder}" id="${el.id}" name="${el.name}"`);
-        });
-        // All buttons  
-        document.querySelectorAll('button').forEach((el, i) => {
-          els.push(`button#${i}: class="${el.className}" aria-label="${el.getAttribute('aria-label')}" text="${el.textContent?.trim().substring(0, 50)}"`);
-        });
-        // Elements with "prompt" or "create" in class/id
-        document.querySelectorAll('[class*="prompt"], [class*="create"], [class*="input"], [class*="editor"], [role="textbox"]').forEach((el, i) => {
-          els.push(`match#${i}: tag=${el.tagName} class="${el.className?.toString().substring(0, 100)}" role="${el.getAttribute('role')}" ce="${el.getAttribute('contenteditable')}"`);
-        });
-        return els;
-      });
-      
-      logger.info('=== DOM DIAGNOSTICS ===');
-      diagnostics.forEach(d => logger.info(d));
-      logger.info('=== END DIAGNOSTICS ===');
+        logger.info('=== DOM DIAGNOSTICS ===');
+        diagnostics.forEach(d => logger.info(d));
+        logger.info('=== END DIAGNOSTICS ===');
+      } catch(e) {
+        logger.info(`page.evaluate() diagnostics failed (likely navigating): ${e}`);
+      }
       
       browser.browser()?.close();
       throw new Error(`Could not find textarea on Suno create page. UI may have changed. URL: ${url}. Diagnostics: ${JSON.stringify(diagnostics)}`);
