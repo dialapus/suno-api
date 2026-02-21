@@ -258,6 +258,9 @@ class SunoApi {
    * @returns {BrowserContext}
    */
   private async launchBrowser(): Promise<BrowserContext> {
+    // Refresh JWT right before browser launch to ensure fresh token
+    await this.keepAlive(true);
+
     const args = [
       '--disable-blink-features=AutomationControlled',
       '--disable-web-security',
@@ -278,23 +281,41 @@ class SunoApi {
       headless: yn(process.env.BROWSER_HEADLESS, { default: true })
     });
     const context = await browser.newContext({ userAgent: this.userAgent, locale: process.env.BROWSER_LOCALE, viewport: null });
-    const cookies = [];
+    const cookies: Array<{name: string, value: string, domain: string, path: string, sameSite: 'Lax' | 'Strict' | 'None'}> = [];
     const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
-    cookies.push({
-      name: '__session',
-      value: this.currentToken+'',
-      domain: '.suno.com',
-      path: '/',
-      sameSite: lax
-    });
-    for (const key in this.cookies) {
+    // Domains that need cookies for Clerk auth to work in browser
+    const domains = ['.suno.com', '.clerk.suno.com', '.accounts.suno.com'];
+    for (const domain of domains) {
       cookies.push({
-        name: key,
-        value: this.cookies[key]+'',
-        domain: '.suno.com',
+        name: '__session',
+        value: this.currentToken+'',
+        domain,
         path: '/',
         sameSite: lax
-      })
+      });
+      for (const key in this.cookies) {
+        cookies.push({
+          name: key,
+          value: this.cookies[key]+'',
+          domain,
+          path: '/',
+          sameSite: lax
+        });
+      }
+    }
+    // Ensure __client_uat is set (Clerk uses this to detect authenticated state)
+    const hasClientUat = cookies.some(c => c.name === '__client_uat');
+    if (!hasClientUat) {
+      const uat = Math.floor(Date.now() / 1000).toString();
+      for (const domain of domains) {
+        cookies.push({
+          name: '__client_uat',
+          value: uat,
+          domain,
+          path: '/',
+          sameSite: lax
+        });
+      }
     }
     await context.addCookies(cookies);
     return context;
@@ -311,11 +332,30 @@ class SunoApi {
     logger.info('CAPTCHA required. Launching browser...')
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
-    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
+    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    // Check if we got redirected to sign-in (auth cookies not recognized)
+    const currentUrl = page.url();
+    logger.info(`Browser navigated to: ${currentUrl}`);
+    if (currentUrl.includes('sign-in') || currentUrl.includes('accounts.suno.com') || currentUrl.includes('/home')) {
+      logger.info('Redirected away from /create — retrying with fresh navigation');
+      // Try navigating directly again after a short delay
+      await page.waitForTimeout(2000);
+      await page.goto('https://suno.com/create', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      const retryUrl = page.url();
+      logger.info(`After retry, browser at: ${retryUrl}`);
+      if (retryUrl.includes('sign-in') || retryUrl.includes('accounts.suno.com')) {
+        browser.browser()?.close();
+        throw new Error('Browser authentication failed — redirected to sign-in. SUNO_COOKIE may be expired or invalid for browser context.');
+      }
+    }
 
     logger.info('Waiting for Suno interface to load');
-    // await page.locator('.react-aria-GridList').waitFor({ timeout: 60000 });
-    await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 }); // wait for song list API call
+    try {
+      await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 }); // wait for song list API call
+    } catch(e) {
+      logger.info('Song list API response not detected, continuing anyway...');
+    }
 
     if (this.ghostCursorEnabled)
       this.cursor = await createCursor(page);
@@ -323,10 +363,44 @@ class SunoApi {
     logger.info('Triggering the CAPTCHA');
     try {
       await page.getByLabel('Close').click({ timeout: 2000 }); // close all popups
-      // await this.click(page, { x: 318, y: 13 });
     } catch(e) {}
 
-    const textarea = page.locator('.custom-textarea');
+    // Try multiple selectors for the textarea (Suno may update UI class names)
+    logger.info('Looking for song description textarea...');
+    let textarea = page.locator('.custom-textarea');
+    try {
+      await textarea.waitFor({ timeout: 15000 });
+    } catch(e) {
+      logger.info('.custom-textarea not found, trying fallback selectors...');
+      // Try alternative selectors
+      const fallbacks = [
+        'textarea[placeholder]',
+        'div[contenteditable="true"]',
+        '[data-testid*="prompt"]',
+        '[class*="textarea"]',
+        '[class*="prompt"]',
+        'textarea',
+      ];
+      let found = false;
+      for (const sel of fallbacks) {
+        try {
+          textarea = page.locator(sel).first();
+          await textarea.waitFor({ timeout: 5000 });
+          logger.info(`Found textarea with fallback selector: ${sel}`);
+          found = true;
+          break;
+        } catch(e2) {}
+      }
+      if (!found) {
+        // Log page content for debugging
+        const pageContent = await page.content();
+        logger.info(`Page URL: ${page.url()}`);
+        logger.info(`Page title: ${await page.title()}`);
+        logger.info(`Page HTML length: ${pageContent.length}`);
+        browser.browser()?.close();
+        throw new Error('Could not find textarea on Suno create page. UI may have changed. URL: ' + page.url());
+      }
+    }
     await this.click(textarea);
     await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
 
