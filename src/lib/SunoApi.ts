@@ -388,11 +388,18 @@ class SunoApi {
     let textarea: Locator = page.locator('textarea').first(); // default, will be overwritten
     let found = false;
     try {
-      // After networkidle wait above, element should be present quickly
-      // 15s as a safety buffer in case networkidle fired slightly early
-      const handle = await page.waitForSelector(textareaCssOrSelector, { timeout: 15000 });
-      const placeholder = await handle.getAttribute('placeholder') ?? '';
-      logger.info(`Textarea appeared with placeholder: "${placeholder}"`);
+      // Use waitForFunction which runs in page context - more reliable than waitForSelector
+      // for dynamically rendered React content. The page can take 30-60s to render in Railway.
+      await page.waitForFunction(
+        () => {
+          // Look for textareas with actual content-related placeholders
+          const textareas = Array.from(document.querySelectorAll('textarea'));
+          return textareas.some(t => t.placeholder && t.placeholder.length > 3);
+        },
+        { timeout: 60000, polling: 1000 }
+      );
+      logger.info('Textarea detected via waitForFunction');
+      
       // Now pick the most appropriate textarea (prefer lyrics/prompt textarea)
       const preferredSelectors = [
         'textarea[placeholder*="lyrics"]',
@@ -415,7 +422,7 @@ class SunoApi {
         }
       }
     } catch(e) {
-      logger.info('No textarea found within 30s');
+      logger.info(`waitForFunction failed: ${e}`);
     }
     if (!found) {
       // Dump DOM diagnostics for debugging
