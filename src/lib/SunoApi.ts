@@ -322,6 +322,63 @@ class SunoApi {
   }
 
   /**
+   * getCaptcha with a hard timeout to prevent server hanging
+   */
+  private async getCaptchaWithTimeout(timeoutMs: number): Promise<string | null> {
+    return Promise.race([
+      this.getCaptcha(),
+      new Promise<string | null>((_, reject) => 
+        setTimeout(() => reject(new Error(`getCaptcha hard timeout after ${timeoutMs}ms`)), timeoutMs)
+      )
+    ]);
+  }
+
+  /**
+   * Try to solve hCaptcha directly via 2Captcha API without browser.
+   * Requires HCAPTCHA_SITEKEY env var or discovers it from /api/c/check response.
+   */
+  private async solveHCaptchaDirect(): Promise<string | null> {
+    if (!process.env.TWOCAPTCHA_KEY || process.env.TWOCAPTCHA_KEY.trim() === '') {
+      logger.info('TWOCAPTCHA_KEY not set — cannot solve hCaptcha directly');
+      return null;
+    }
+
+    // Try to get sitekey from env or use known Suno hCaptcha sitekey
+    let sitekey = process.env.HCAPTCHA_SITEKEY || '';
+    
+    if (!sitekey) {
+      // Try to discover sitekey from /api/c/check response (some implementations return it)
+      try {
+        const resp = await this.client.post(`${SunoApi.BASE_URL}/api/c/check`, {
+          ctype: 'generation'
+        });
+        logger.info(`/api/c/check full response: ${JSON.stringify(resp.data)}`);
+        sitekey = resp.data?.sitekey || resp.data?.site_key || resp.data?.hcaptcha_sitekey || '';
+      } catch (e: any) {
+        logger.info(`/api/c/check error: ${e.message}`);
+      }
+    }
+
+    if (!sitekey) {
+      logger.info('No hCaptcha sitekey available — cannot solve directly');
+      return null;
+    }
+
+    logger.info(`Attempting direct hCaptcha solve via 2Captcha API with sitekey: ${sitekey}`);
+    try {
+      const result = await this.solver.hcaptcha({
+        sitekey: sitekey,
+        pageurl: 'https://suno.com/create'
+      });
+      logger.info(`2Captcha hCaptcha solved successfully, token length: ${result.data?.length}`);
+      return result.data;
+    } catch (e: any) {
+      logger.info(`Direct hCaptcha solving failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  /**
    * Checks for CAPTCHA verification and solves the CAPTCHA if needed
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
@@ -329,9 +386,17 @@ class SunoApi {
     if (!await this.captchaRequired())
       return null;
 
-    // If 2Captcha key is not configured, skip browser flow — captcha will be attempted without token
+    // Strategy A: Try direct hCaptcha solving via 2Captcha API (no browser needed!)
+    const directToken = await this.solveHCaptchaDirect();
+    if (directToken) {
+      logger.info('hCaptcha solved directly via 2Captcha API (no browser needed)');
+      return directToken;
+    }
+
+    // Strategy B: Fall back to browser-based solving
+    // If 2Captcha key is not configured, skip browser flow
     if (!process.env.TWOCAPTCHA_KEY || process.env.TWOCAPTCHA_KEY.trim() === '') {
-      logger.info('CAPTCHA required but TWOCAPTCHA_KEY not set — skipping captcha browser flow, sending null token');
+      logger.info('CAPTCHA required but TWOCAPTCHA_KEY not set — sending null token');
       return null;
     }
 
@@ -810,48 +875,84 @@ class SunoApi {
     continue_at?: number
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
-    const payload: any = {
+    
+    // Strategy 1: Try WITHOUT captcha token first (like working Python Suno-API library)
+    // The Python library by Malith-Rukshan generates successfully without token/generation_type fields
+    const basePayload: any = {
       make_instrumental: make_instrumental,
       mv: model || DEFAULT_MODEL,
       prompt: '',
-      generation_type: 'TEXT',
-      continue_at: continue_at,
-      continue_clip_id: continue_clip_id,
-      task: task,
-      token: await this.getCaptcha()
     };
+    // Only include optional fields if they have values
+    if (continue_at !== undefined) basePayload.continue_at = continue_at;
+    if (continue_clip_id) basePayload.continue_clip_id = continue_clip_id;
+    if (task) basePayload.task = task;
+
     if (isCustom) {
-      payload.tags = tags;
-      payload.title = title;
-      payload.negative_tags = negative_tags;
-      payload.prompt = prompt;
+      basePayload.tags = tags;
+      basePayload.title = title;
+      basePayload.negative_tags = negative_tags;
+      basePayload.prompt = prompt;
     } else {
-      payload.gpt_description_prompt = prompt;
+      basePayload.gpt_description_prompt = prompt;
     }
+    
     logger.info(
-      'generateSongs payload:\n' +
-        JSON.stringify(
-          {
-            prompt: prompt,
-            isCustom: isCustom,
-            tags: tags,
-            title: title,
-            make_instrumental: make_instrumental,
-            wait_audio: wait_audio,
-            negative_tags: negative_tags,
-            payload: payload
-          },
-          null,
-          2
-        )
+      'generateSongs payload (no-captcha attempt):\n' +
+        JSON.stringify(basePayload, null, 2)
     );
-    const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2/`,
-      payload,
-      {
-        timeout: 10000 // 10 seconds timeout
+
+    let response;
+    try {
+      // Attempt 1: Generate without captcha token
+      response = await this.client.post(
+        `${SunoApi.BASE_URL}/api/generate/v2/`,
+        basePayload,
+        { timeout: 15000 }
+      );
+    } catch (err: any) {
+      const statusCode = err?.response?.status;
+      const errorData = err?.response?.data;
+      const errorDetail = errorData?.detail || '';
+      logger.info(`No-captcha attempt failed: status=${statusCode}, detail=${JSON.stringify(errorData)}`);
+      
+      // Check if the error is specifically about captcha being required
+      const isCaptchaError = statusCode === 403 || statusCode === 429 || 
+        (typeof errorDetail === 'string' && (
+          errorDetail.toLowerCase().includes('captcha') || 
+          errorDetail.toLowerCase().includes('verification') ||
+          errorDetail.toLowerCase().includes('token')
+        ));
+
+      if (!isCaptchaError) {
+        // Not a captcha error — re-throw the original error
+        throw err;
       }
-    );
+
+      logger.info('Captcha appears to be required. Trying captcha strategies...');
+
+      // Strategy 2: Try with captcha token
+      let captchaToken: string | null = null;
+      try {
+        captchaToken = await this.getCaptchaWithTimeout(90000); // 90 second hard timeout
+      } catch (captchaErr: any) {
+        logger.info(`Captcha solving failed: ${captchaErr.message}`);
+      }
+
+      // Retry with captcha token (or null if captcha solving failed)
+      const retryPayload = {
+        ...basePayload,
+        generation_type: 'TEXT',
+        token: captchaToken
+      };
+      logger.info(`Retrying generate with captcha token: ${captchaToken ? 'present' : 'null'}`);
+      response = await this.client.post(
+        `${SunoApi.BASE_URL}/api/generate/v2/`,
+        retryPayload,
+        { timeout: 15000 }
+      );
+    }
+
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
