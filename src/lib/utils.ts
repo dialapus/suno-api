@@ -75,17 +75,17 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
       }
     };
 
-    // Wait for an hCaptcha request for up to 1 minute
+    // Wait for an hCaptcha request for up to 30 seconds
     const initialTimeout = setTimeout(() => {
       if (!requestOccurred) {
         page.off('request', onRequest);
         cleanupListeners();
-        reject(new Error('No hCaptcha request occurred within 1 minute.'));
+        reject(new Error('No hCaptcha request occurred within 30 seconds.'));
       } else {
         // Start waiting for no hCaptcha requests
         resetTimeout();
       }
-    }, 60000); // 1 minute timeout
+    }, 30000); // 30 second timeout
 
     page.on('request', onRequest);
     page.on('requestfinished', onRequestFinished);

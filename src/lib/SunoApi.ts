@@ -338,7 +338,7 @@ class SunoApi {
     logger.info('CAPTCHA required. Launching browser...')
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
-    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'load', timeout: 60000 });
+    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'load', timeout: 30000 });
 
     // Check if we got redirected to sign-in (auth cookies not recognized)
     const currentUrl = page.url();
@@ -346,8 +346,8 @@ class SunoApi {
     if (currentUrl.includes('sign-in') || currentUrl.includes('accounts.suno.com') || currentUrl.includes('/home')) {
       logger.info('Redirected away from /create — retrying with fresh navigation');
       // Try navigating directly again after a short delay
-      await page.waitForTimeout(2000);
-      await page.goto('https://suno.com/create', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForTimeout(1000);
+      await page.goto('https://suno.com/create', { waitUntil: 'domcontentloaded', timeout: 30000 });
       const retryUrl = page.url();
       logger.info(`After retry, browser at: ${retryUrl}`);
       if (retryUrl.includes('sign-in') || retryUrl.includes('accounts.suno.com')) {
@@ -359,13 +359,13 @@ class SunoApi {
     logger.info('Waiting for Suno interface to fully render (React hydration)...');
     try {
       // Wait for network to be idle (signals React has loaded all data and rendered)
-      // This is critical on Railway where headless browser renders very slowly (~30s+)
-      await page.waitForLoadState('networkidle', { timeout: 60000 });
+      // Reduced to 30s on Railway to avoid total timeout >5 minutes
+      await page.waitForLoadState('networkidle', { timeout: 30000 });
       logger.info('Network idle — React should be hydrated');
     } catch(e) {
       logger.info('Network idle timeout — trying domcontentloaded fallback');
       try {
-        await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+        await page.waitForLoadState('domcontentloaded', { timeout: 10000 });
         logger.info('DOM content loaded');
       } catch(e2) {
         logger.info('domcontentloaded also timed out — proceeding anyway');
@@ -374,7 +374,7 @@ class SunoApi {
 
     // Extra safety: wait until page stops navigating (URL stabilizes)
     try {
-      await page.waitForURL('**/create**', { timeout: 15000, waitUntil: 'domcontentloaded' });
+      await page.waitForURL('**/create**', { timeout: 10000, waitUntil: 'domcontentloaded' });
       logger.info(`URL stabilized at: ${page.url()}`);
     } catch(e) {
       logger.info(`waitForURL /create failed or timed out: ${page.url()}`);
@@ -416,26 +416,26 @@ class SunoApi {
     
     let textarea: Locator = page.locator('textarea').first(); // default, will be overwritten
     let found = false;
-    // Retry waitForFunction in case of transient navigation errors
-    for (let attempt = 0; attempt < 3 && !found; attempt++) {
+    // Retry waitForFunction in case of transient navigation errors (max 2 attempts to stay under 3-min limit)
+    for (let attempt = 0; attempt < 2 && !found; attempt++) {
       if (attempt > 0) {
         logger.info(`Retry attempt ${attempt} for textarea detection...`);
-        await page.waitForTimeout(3000);
+        await page.waitForTimeout(2000);
         // Ensure page is stable before retrying
         try {
-          await page.waitForLoadState('domcontentloaded', { timeout: 10000 });
+          await page.waitForLoadState('domcontentloaded', { timeout: 8000 });
         } catch(e) {}
       }
       try {
         // Use waitForFunction which runs in page context - more reliable than waitForSelector
-        // for dynamically rendered React content. The page can take 30-60s to render in Railway.
+        // for dynamically rendered React content. Reduced to 30s to stay under Railway timeout.
         await page.waitForFunction(
           () => {
             // Look for textareas with actual content-related placeholders
             const textareas = Array.from(document.querySelectorAll('textarea'));
             return textareas.some(t => t.placeholder && t.placeholder.length > 3);
           },
-          { timeout: 60000, polling: 1000 }
+          { timeout: 30000, polling: 1000 }
         );
         logger.info('Textarea detected via waitForFunction');
         
@@ -470,7 +470,7 @@ class SunoApi {
         if (e.message?.includes('navigating') || e.message?.includes('navigation')) {
           // Page is navigating — wait for it to settle
           try {
-            await page.waitForLoadState('load', { timeout: 30000 });
+            await page.waitForLoadState('load', { timeout: 15000 });
             logger.info('Page load state recovered after navigation error');
           } catch(e2) {
             logger.info(`Load state recovery failed: ${e2}`);
@@ -593,8 +593,8 @@ class SunoApi {
       });
       // Safety timeout: if hCaptcha flow takes too long, reject instead of hanging forever
       setTimeout(() => {
-        reject(new Error('getCaptcha timeout: no token intercepted within 5 minutes'));
-      }, 300000);
+        reject(new Error('getCaptcha timeout: no token intercepted within 2 minutes'));
+      }, 120000);
     });
 
     new Promise<void>(async (resolve, reject) => {
