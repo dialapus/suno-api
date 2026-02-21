@@ -3,7 +3,7 @@ import { corsHeaders } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 
-const BUILD_VERSION = "2026-02-21-v2-nocaptcha-first";
+const BUILD_VERSION = "2026-02-21-v3-direct-hcaptcha";
 const BUILD_TIME = new Date().toISOString();
 
 export async function GET() {

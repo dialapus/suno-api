@@ -334,8 +334,15 @@ class SunoApi {
   }
 
   /**
+   * Known hCaptcha sitekey for Suno's generation captcha.
+   * Extracted from Suno's JS bundle (b4ceaca55fcb6153.js).
+   * Can be overridden via HCAPTCHA_SITEKEY env var.
+   */
+  private static readonly HCAPTCHA_SITEKEY = 'd65453de-3f1a-4aac-9366-a0f06e52b2ce';
+
+  /**
    * Try to solve hCaptcha directly via 2Captcha API without browser.
-   * Requires HCAPTCHA_SITEKEY env var or discovers it from /api/c/check response.
+   * Uses known Suno hCaptcha sitekey or HCAPTCHA_SITEKEY env var.
    */
   private async solveHCaptchaDirect(): Promise<string | null> {
     if (!process.env.TWOCAPTCHA_KEY || process.env.TWOCAPTCHA_KEY.trim() === '') {
@@ -343,26 +350,7 @@ class SunoApi {
       return null;
     }
 
-    // Try to get sitekey from env or use known Suno hCaptcha sitekey
-    let sitekey = process.env.HCAPTCHA_SITEKEY || '';
-    
-    if (!sitekey) {
-      // Try to discover sitekey from /api/c/check response (some implementations return it)
-      try {
-        const resp = await this.client.post(`${SunoApi.BASE_URL}/api/c/check`, {
-          ctype: 'generation'
-        });
-        logger.info(`/api/c/check full response: ${JSON.stringify(resp.data)}`);
-        sitekey = resp.data?.sitekey || resp.data?.site_key || resp.data?.hcaptcha_sitekey || '';
-      } catch (e: any) {
-        logger.info(`/api/c/check error: ${e.message}`);
-      }
-    }
-
-    if (!sitekey) {
-      logger.info('No hCaptcha sitekey available — cannot solve directly');
-      return null;
-    }
+    const sitekey = process.env.HCAPTCHA_SITEKEY || SunoApi.HCAPTCHA_SITEKEY;
 
     logger.info(`Attempting direct hCaptcha solve via 2Captcha API with sitekey: ${sitekey}`);
     try {
