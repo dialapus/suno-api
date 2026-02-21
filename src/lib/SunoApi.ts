@@ -332,7 +332,7 @@ class SunoApi {
     logger.info('CAPTCHA required. Launching browser...')
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
-    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'load', timeout: 60000 });
 
     // Check if we got redirected to sign-in (auth cookies not recognized)
     const currentUrl = page.url();
@@ -352,9 +352,15 @@ class SunoApi {
 
     logger.info('Waiting for Suno interface to load');
     try {
-      await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 }); // wait for song list API call
+      // Wait for any Suno API response that signals the app is hydrated
+      await Promise.race([
+        page.waitForResponse(resp => resp.url().includes('suno.com/api/') || resp.url().includes('studio-api.prod.suno.com'), { timeout: 15000 }),
+        page.waitForSelector('textarea, [contenteditable="true"], [class*="textarea"]', { timeout: 15000 }),
+      ]);
+      logger.info('Suno interface detected (API response or textarea)');
     } catch(e) {
-      logger.info('Song list API response not detected, continuing anyway...');
+      logger.info('Neither API response nor textarea detected within 15s, adding extra wait...');
+      await page.waitForTimeout(5000); // Give React more time to hydrate
     }
 
     if (this.ghostCursorEnabled)
@@ -382,10 +388,13 @@ class SunoApi {
     ];
     let textarea = page.locator(selectors[0]);
     let found = false;
-    for (const sel of selectors) {
+    for (let i = 0; i < selectors.length; i++) {
+      const sel = selectors[i];
+      // Give more time to first/primary selectors; less to legacy fallbacks
+      const timeout = i < 3 ? 10000 : 5000;
       try {
         textarea = page.locator(sel).first();
-        await textarea.waitFor({ timeout: 5000 });
+        await textarea.waitFor({ timeout });
         logger.info(`Found textarea with selector: ${sel}`);
         found = true;
         break;
